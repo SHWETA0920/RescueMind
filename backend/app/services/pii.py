@@ -1,17 +1,10 @@
 """
 Safety guardrail: mask PII before any text is sent to a cloud LLM.
 
-This is deliberately regex/rule-based rather than a black-box model --
-for a safety-critical redaction step you want something you can read,
-test, and reason about. It's not a complete PII solution (a
-production build should add a proper NER model, e.g. Presidio, for
-free-text names), but it reliably catches the structured PII that
-appears in emergency-call transcripts: phone numbers, emails,
-government ID-shaped numbers, and street addresses' house numbers.
-
-Each masker returns (masked_text, list_of_redaction_labels) so the
-caller can log *that* something was redacted without ever storing the
-original value.
+Deliberately regex/rule-based so it can be read, tested and reasoned about.
+Not a complete PII solution (production should add an NER model such as
+Presidio for free-text names). Each masker returns (masked_text, labels) so
+callers can log THAT something was redacted without storing the original.
 """
 
 import re
@@ -23,10 +16,12 @@ _PATTERNS: list[tuple[str, re.Pattern]] = [
     ("credit_card", re.compile(r"\b(?:\d[ -]*?){13,16}\b")),
 ]
 
-# Very small heuristic name-masker: "my name is X", "this is X calling"
+# The lead-in phrase is case-insensitive, but the name itself must be
+# Capitalised, so "I'm scared" or "my name is Sarah and" are not over-matched.
+_NAME = r"([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)"
 _NAME_PATTERNS = [
-    re.compile(r"(?i)\bmy name is ([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)"),
-    re.compile(r"(?i)\bthis is ([A-Z][a-z]+(?:\s[A-Z][a-z]+)?) calling"),
+    re.compile(r"(?i:\bmy name(?:\s+is|['’]s)|\bthe name is|\bi am|\bi['’]m|\bcall me)\s+" + _NAME),
+    re.compile(r"(?i:\bthis is)\s+" + _NAME + r"(?=\s+(?i:calling|speaking|here)\b)"),
 ]
 
 
@@ -43,10 +38,17 @@ def mask_pii(text: str) -> tuple[str, list[str]]:
             redactions.append(label)
             masked = pattern.sub(f"[REDACTED_{label.upper()}]", masked)
 
+    # Collect every stated name, then mask ALL later mentions of it too.
+    tokens: set[str] = set()
     for pattern in _NAME_PATTERNS:
-        match = pattern.search(masked)
-        if match:
-            redactions.append("caller_name")
-            masked = masked[: match.start(1)] + "[REDACTED_NAME]" + masked[match.end(1):]
+        for match in pattern.finditer(masked):
+            name = match.group(1)
+            tokens.add(name)
+            tokens.update(name.split())
+
+    if tokens:
+        redactions.append("caller_name")
+        for token in sorted(tokens, key=len, reverse=True):
+            masked = re.sub(rf"\b{re.escape(token)}\b", "[REDACTED_NAME]", masked)
 
     return masked, redactions
